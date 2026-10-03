@@ -5,6 +5,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
+#include "strata/kernels/cpu/iq_avxvnni.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
@@ -80,10 +81,13 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
                     int r0, int r1) {
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
     // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
-    // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the
-    // AVX-2 kernel, STRATA_NO_IQ256 drops the AVX-2 kernel; ggml-cpu's single-token vec_dot is reached only with
-    // both set (and on a CPU without AVX-512, STRATA_NO_IQ512 changes nothing).
+    // first, then the VEX-256 VNNI one (iq_avxvnni.cpp: Alder Lake and newer CPUs without AVX-512) for the formats
+    // it has - IQ3_S so far, the only i-quant whose prescaled grid bytes stay in a byte - then the AVX-2 one
+    // (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the AVX-2 kernel, STRATA_NO_IQ256
+    // drops the AVX-2 kernel; ggml-cpu's single-token vec_dot is reached only with both set (and on a CPU without
+    // AVX-512, STRATA_NO_IQ512 changes nothing).
     static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
+    static const bool vnni = cpu_avxvnni_ok();
     static const bool avx2 = std::getenv("STRATA_NO_IQ256") == nullptr;
     // #152: from how many tokens the multi-token kernels run (ggml's vec_dot below that).  The default 2 is the
     // measured-fastest rule, but a token's expert rows then round differently alone than in a group, so greedy output
@@ -105,6 +109,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     if (nt >= mt_min && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
         if (avx512 && iq512_supported(f.gu_type)) {
             iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+            return;
+        }
+        if (vnni && iqvnni_supported(f.gu_type)) {
+            iqvnni_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
             return;
         }
         if (avx2 && iq256_supported(f.gu_type)) {
@@ -138,7 +146,11 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
         return;
     }
     if (nt >= mt_min && f.d_type == 20 && iq4nl_mt) {   // #152: the same rule as the gate/up rows
-        iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        if (cpu_avxvnni_ok()) {
+            iq4nl256_down_rows_vnni(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        } else {
+            iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        }
         return;
     }
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;

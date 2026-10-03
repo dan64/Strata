@@ -85,6 +85,41 @@ bool cpu_avx2_ok() {
     return ok;
 }
 
+bool cpu_avxvnni_ok() {
+    static const bool ok = [] {
+        if (const char* f = std::getenv("STRATA_FORCE_AVX2"); f != nullptr && f[0] == '1') return false;
+        if (const char* f = std::getenv("STRATA_NO_VNNI"); f != nullptr && f[0] == '1') return false;
+        unsigned r[4] = {0, 0, 0, 0};
+        auto cpuid = [&](unsigned leaf, unsigned sub) {
+#if defined(_MSC_VER)
+            int x[4];
+            __cpuidex(x, (int) leaf, (int) sub);
+            for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i];
+#else
+            __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);
+#endif
+        };
+        cpuid(0, 0);
+        if (r[0] < 7) return false;
+        cpuid(1, 0);
+        if (!((r[2] >> 27) & 1u)) return false;             // OSXSAVE (the VNNI kernels are AVX2 code)
+#if defined(_MSC_VER)
+        const unsigned long long xcr0 = _xgetbv(0);
+#else
+        unsigned lo = 0, hi = 0;
+        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+        const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
+#endif
+        if ((xcr0 & 0x6) != 0x6) return false;              // the OS saves the SSE and AVX state
+        cpuid(7, 0);
+        if (!((r[1] >> 5) & 1u)) return false;              // AVX2
+        if (r[0] < 1) return false;                         // no subleaf 1: no AVX-VNNI bit to read
+        cpuid(7, 1);
+        return ((r[0] >> 4) & 1u) != 0;                     // AVX-VNNI (VEX 256-bit `vpdpbusd`)
+    }();
+    return ok;
+}
+
 std::string cpu_name() {
     unsigned r[12] = {};
 #if defined(_MSC_VER)
@@ -110,8 +145,13 @@ std::string cpu_name() {
 
 void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
                  int r0, int r1) {
-    if (cpu_avx512_ok()) q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);
-    else q2_0_gguf_rows_multi_avx2(w, row_bytes, nblocks, a, nt, out, r0, r1);
+    if (cpu_avx512_ok()) {
+        q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);
+    } else if (cpu_avxvnni_ok()) {
+        q2_0_gguf_rows_multi_vnni(w, row_bytes, nblocks, a, nt, out, r0, r1);
+    } else {
+        q2_0_gguf_rows_multi_avx2(w, row_bytes, nblocks, a, nt, out, r0, r1);
+    }
 }
 
 void act_quant_any(const float* x, int n, ActQ& a) {
